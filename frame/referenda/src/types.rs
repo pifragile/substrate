@@ -16,15 +16,17 @@
 // limitations under the License.
 
 //! Miscellaneous additional datatypes.
-
 use super::*;
 use codec::{Decode, Encode, EncodeLike, MaxEncodedLen};
+use fixed::{
+	transcendental::{ln, pow},
+	types::I64F64,
+};
 use frame_support::{traits::schedule::Anon, Parameter};
 use scale_info::TypeInfo;
 use sp_arithmetic::{Rounding::*, SignedRounding::*};
 use sp_runtime::{FixedI64, PerThing, RuntimeDebug};
 use sp_std::fmt::Debug;
-
 pub type BalanceOf<T, I = ()> =
 	<<T as Config<I>>::Currency as Currency<<T as frame_system::Config>::AccountId>>::Balance;
 pub type NegativeImbalanceOf<T, I> = <<T as Config<I>>::Currency as Currency<
@@ -259,6 +261,9 @@ pub enum Curve {
 	SteppedDecreasing { begin: Perbill, end: Perbill, step: Perbill, period: Perbill },
 	/// A recipocal (`K/(x+S)-T`) curve: `factor` is `K` and `x_offset` is `S`, `y_offset` is `T`.
 	Reciprocal { factor: FixedI64, x_offset: FixedI64, y_offset: FixedI64 },
+	/// Exponential decay curve defined by `f(x) = n_0 * (2 ^ -(x / half_time)) + offset`
+	/// https://en.wikipedia.org/wiki/Exponential_decay
+	ExponentialDecay { n_0: I64F64, half_time: I64F64, offset: I64F64 },
 }
 
 /// Calculate the quadratic solution for the given curve.
@@ -336,6 +341,16 @@ impl Curve {
 		Curve::Reciprocal { factor, x_offset, y_offset }
 	}
 
+	/// Create a `Curve::ExponentialDecay` instance from a high-level description.
+	///
+	/// WARNING: This is a `const` function designed for convenient use at build time and
+	/// will panic on overflow. Ensure that any inputs are sensible.
+	pub const fn make_exponential_decay(floor: I64F64, ceil: I64F64, half_time: I64F64) -> Curve {
+		let n_0 = ceil.saturating_sub(floor);
+		let offset = floor;
+		Curve::ExponentialDecay { half_time, n_0, offset }
+	}
+
 	/// Print some info on the curve.
 	#[cfg(feature = "std")]
 	pub fn info(&self, days: u32, name: impl std::fmt::Display) {
@@ -405,6 +420,19 @@ impl Curve {
 				.checked_rounding_div(FixedI64::from(x) + *x_offset, Low)
 				.map(|yp| (yp + *y_offset).into_clamped_perthing())
 				.unwrap_or_else(Perbill::one),
+			Self::ExponentialDecay { n_0, half_time, offset } => {
+				//n_0 * (2 ^ -(x / half_time)) + offset
+				if let Some(exponent) = <Perbill as Into<I64F64>>::into(x).checked_div(*half_time) {
+					if let Ok(exponential) = pow(I64F64::from(2), -exponent) {
+						if let Some(decay) = n_0.checked_mul(exponential) {
+							if let Some(full_formula) = offset.checked_add(decay) {
+								return full_formula.into()
+							}
+						}
+					}
+				}
+				Perbill::one()
+			},
 		}
 	}
 
@@ -460,6 +488,24 @@ impl Curve {
 					.and_then(|term| (term - *x_offset).try_into_perthing().ok())
 					.unwrap_or_else(Perbill::one)
 			},
+			Self::ExponentialDecay { n_0, half_time, offset } => {
+				// x = (half_time * (log(-n_0/(offset-y))))/log(2)
+				if let Some(offset_minus_y) = offset.checked_sub(y.into()) {
+					if let Some(inner_log) = n_0.checked_div(offset_minus_y) {
+						if let Ok(log_term) = ln(-inner_log) {
+							if let Some(numerator) = half_time.checked_mul(log_term) {
+								if let Ok(denominator) = ln(I64F64::from_num(2i32)) {
+									if let Some(full_formula) = numerator.checked_div(denominator) {
+										return full_formula.into()
+									}
+								}
+							}
+						}
+					}
+				}
+
+				Perbill::one()
+			},
 		}
 	}
 
@@ -492,6 +538,13 @@ impl Debug for Curve {
 					f,
 					"Reciprocal[factor of {:?}, x_offset of {:?}, y_offset of {:?}]",
 					factor, x_offset, y_offset,
+				)
+			},
+			Self::ExponentialDecay { n_0, half_time, offset } => {
+				write!(
+					f,
+					"Exponential Decay[n_0 = {:?}, half_time = {:?}, offset = {:?}]",
+					n_0, half_time, offset,
 				)
 			},
 		}
@@ -644,5 +697,70 @@ mod tests {
 		assert_eq!(c.delay(pc(30)), pc(75));
 		assert_eq!(c.delay(pc(30).less_epsilon()), pc(100));
 		assert_eq!(c.delay(pc(0)), pc(100));
+	}
+
+	#[test]
+	fn exponential_decay_works() {
+		fn pc(x: u32) -> Perbill {
+			Perbill::from_percent(x)
+		}
+		fn abs_diff(a: Perbill, b: Perbill) -> Perbill {
+			if a > b {
+				return a - b
+			}
+			b - a
+		}
+		fn almost_equal(a: Perbill, b: Perbill) -> bool {
+			abs_diff(a, b) < Perbill::from_float(0.0000001)
+		}
+
+		let mut c: Curve = Curve::ExponentialDecay {
+			n_0: I64F64::from_num(0.8),
+			half_time: I64F64::from_num(0.5),
+			offset: I64F64::from_num(0.1),
+		};
+
+		assert!(almost_equal(c.threshold(pc(50)), pc(50)));
+		assert!(almost_equal(c.threshold(pc(30)), Perbill::from_float(0.6278031643091577)));
+		assert!(almost_equal(c.threshold(pc(0)), pc(90)));
+		assert!(almost_equal(c.threshold(pc(100)), pc(30)));
+
+		assert!(almost_equal(c.delay(pc(50)), pc(50)));
+		assert!(almost_equal(c.delay(Perbill::from_float(0.6278031643091577)), pc(30)));
+		assert!(almost_equal(c.delay(pc(90)), pc(0)));
+		assert!(almost_equal(c.delay(pc(30)), pc(100)));
+
+		c = Curve::ExponentialDecay {
+			n_0: I64F64::from_num(1.0),
+			half_time: I64F64::from_num(0.6),
+			offset: I64F64::from_num(0.0),
+		};
+
+		assert!(almost_equal(c.threshold(pc(60)), pc(50)));
+		assert!(almost_equal(c.threshold(pc(70)), Perbill::from_float(0.44544935907016964)));
+		assert!(almost_equal(c.threshold(pc(0)), pc(100)));
+		assert!(almost_equal(c.threshold(pc(100)), Perbill::from_float(0.3149802624737183)));
+
+		assert!(almost_equal(c.delay(pc(50)), pc(60)));
+		assert!(almost_equal(c.delay(Perbill::from_float(0.44544935907016964)), pc(70)));
+		assert!(almost_equal(c.delay(pc(100)), pc(0)));
+		assert!(almost_equal(c.delay(Perbill::from_float(0.3149802624737183)), pc(100)));
+	}
+
+	#[test]
+	fn make_exponential_decay_works() {
+		let c: Curve = Curve::make_exponential_decay(
+			I64F64::from_num(0.1),
+			I64F64::from_num(0.9),
+			I64F64::from_num(0.5),
+		);
+		assert_eq!(
+			c,
+			Curve::ExponentialDecay {
+				half_time: I64F64::from_num(0.5),
+				offset: I64F64::from_num(0.1),
+				n_0: I64F64::from_num(0.9) - I64F64::from_num(0.1)
+			}
+		);
 	}
 }

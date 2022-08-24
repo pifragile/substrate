@@ -422,16 +422,13 @@ impl Curve {
 				.unwrap_or_else(Perbill::one),
 			Self::ExponentialDecay { n_0, half_time, offset } => {
 				//n_0 * (2 ^ -(x / half_time)) + offset
-				if let Some(exponent) = <Perbill as Into<I64F64>>::into(x).checked_div(*half_time) {
-					if let Ok(exponential) = pow(I64F64::from(2), -exponent) {
-						if let Some(decay) = n_0.checked_mul(exponential) {
-							if let Some(full_formula) = offset.checked_add(decay) {
-								return full_formula.into()
-							}
-						}
-					}
-				}
-				Perbill::one()
+				<Perbill as Into<I64F64>>::into(x)
+					.checked_div(*half_time)
+					.and_then(|exponent| pow(I64F64::from(2), -exponent).ok())
+					.and_then(|exponential| n_0.checked_mul(exponential))
+					.and_then(|decay| offset.checked_add(decay))
+					.unwrap_or(I64F64::from_num(1))
+					.into()
 			},
 		}
 	}
@@ -490,21 +487,18 @@ impl Curve {
 			},
 			Self::ExponentialDecay { n_0, half_time, offset } => {
 				// x = (half_time * (log(-n_0/(offset-y))))/log(2)
-				if let Some(offset_minus_y) = offset.checked_sub(y.into()) {
-					if let Some(inner_log) = n_0.checked_div(offset_minus_y) {
-						if let Ok(log_term) = ln(-inner_log) {
-							if let Some(numerator) = half_time.checked_mul(log_term) {
-								if let Ok(denominator) = ln(I64F64::from_num(2i32)) {
-									if let Some(full_formula) = numerator.checked_div(denominator) {
-										return full_formula.into()
-									}
-								}
-							}
-						}
-					}
-				}
-
-				Perbill::one()
+				offset
+					.checked_sub(y.into())
+					.and_then(|offset_minus_y| n_0.checked_div(offset_minus_y))
+					.and_then(|inner_log| ln(-inner_log).ok())
+					.and_then(|log_term| half_time.checked_mul(log_term))
+					.and_then(|numerator| {
+						ln(I64F64::from_num(2i32))
+							.ok()
+							.and_then(|denominator| numerator.checked_div(denominator))
+					})
+					.unwrap_or(I64F64::from_num(1))
+					.into()
 			},
 		}
 	}

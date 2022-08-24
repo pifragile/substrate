@@ -42,6 +42,7 @@ std = [
 	"serde",
 	"sp-debug-derive/std",
 	"sp-std/std",
+	"fixed/std"
 ]
 
 [[bench]]

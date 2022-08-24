@@ -49,6 +49,7 @@ std = [
 	"sp-io/std",
 	"sp-runtime/std",
 	"sp-std/std",
+	"fixed/std"
 ]
 runtime-benchmarks = [
 	"assert_matches",
